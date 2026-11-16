@@ -11,6 +11,8 @@ Chave privada do Snowflake, em ordem de prioridade:
 from __future__ import annotations
 
 import os
+import re
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,11 +43,37 @@ def _optional(name: str, default: str | None = None) -> str | None:
     return value or default
 
 
+_PEM_RE = re.compile(
+    r"-----BEGIN ([A-Z ]*PRIVATE KEY)-----(.*?)-----END \1-----", re.DOTALL
+)
+
+
+def _normalize_pem(raw: str) -> bytes:
+    """Remonta o PEM a partir de um secret colado de forma imperfeita.
+
+    Aceita: quebras de linha trocadas por espaços, "\\n" literal, CRLF, aspas
+    em volta, indentação, e até só o corpo base64 sem BEGIN/END.
+    """
+    text = raw.strip().strip("'\"").replace("\\n", "\n").replace("\r", "")
+    match = _PEM_RE.search(text)
+    if match:
+        label, body = match.group(1), match.group(2)
+    else:
+        label, body = "PRIVATE KEY", text
+    body = re.sub(r"\s+", "", body)
+    if not body or not re.fullmatch(r"[A-Za-z0-9+/=]+", body):
+        raise ConfigError(
+            "SNOWFLAKE_PRIVATE_KEY não contém uma chave PEM válida "
+            f"({len(raw)} caracteres recebidos; esperado o conteúdo completo do .p8)"
+        )
+    lines = "\n".join(textwrap.wrap(body, 64))
+    return f"-----BEGIN {label}-----\n{lines}\n-----END {label}-----\n".encode()
+
+
 def _load_private_key_der() -> bytes:
     pem_content = _optional("SNOWFLAKE_PRIVATE_KEY")
     if pem_content:
-        # Secrets às vezes chegam com "\n" literal em vez de quebras de linha.
-        pem_bytes = pem_content.replace("\\n", "\n").encode()
+        pem_bytes = _normalize_pem(pem_content)
         source = "SNOWFLAKE_PRIVATE_KEY"
     else:
         key_path = Path(_required("SNOWFLAKE_PRIVATE_KEY_PATH"))
