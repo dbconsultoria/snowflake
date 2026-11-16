@@ -4,6 +4,11 @@ Recriação do data lake do [myspark](https://github.com/dbconsultoria/myspark) 
 mesma modelagem medallion. Fonte OLTP: **TiDB Cloud** (MySQL, porta 4000, TLS obrigatório).
 Processamento em **Python**, orquestração por **GitHub Actions**. Sem Spark, sem Airflow.
 
+![Arquitetura do MYSPARK_DL: TiDB Cloud → Bronze → Silver → Gold → testes de qualidade no Snowflake, orquestrado pelo GitHub Actions](MySpark%20Data%20Lake%20Medallion%20Architecture.png)
+
+<details>
+<summary>Versão em texto do fluxo</summary>
+
 ```
 TiDB (tbcategories, tbproducts, tbcustomers, tborders, tborderdetail)
   │  PyMySQL + TLS
@@ -18,6 +23,8 @@ GOLD     DIM_CATEGORIES / DIM_PRODUCTS / DIM_CUSTOMERS (SCD2, MERGE) + FACT_ORDE
 tests    reconciliação entre camadas, unicidade SCD2, fato sem chave órfã
 CONTROL  ETL_RUN_LOG (cada etapa/tabela) + WATERMARK (carga incremental)
 ```
+
+</details>
 
 ## Estrutura
 
