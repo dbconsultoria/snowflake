@@ -217,4 +217,107 @@ ressincronizar tudo, volte para `FULL` por uma execução.
   pipeline a detecta. Pedidos feitos entre a alteração real e a execução ficam com a versão
   anterior.
 - `CREATE TABLE IF NOT EXISTS` não altera tabelas existentes. Uma evolução de schema exige
-  `ALTER`.
+  `ALTER` (ver Apêndice A).
+
+---
+
+## Apêndice A — Adicionando uma nova dimensão
+
+O pipeline não descobre tabelas novas sozinho: cada camada é declarada explicitamente. Incluir uma
+dimensão é basicamente copiar os padrões que já existem. O workflow do GitHub Actions **não muda**,
+porque ele executa tudo o que estiver nas pastas `sql/`.
+
+Exemplo usado abaixo: entra na fonte uma tabela `tbsuppliers (code, name, email)` e a
+`tbproducts` ganha a coluna `supplier`.
+
+### A.1 Passo a passo
+
+**1. Extração** (`etl/extract.py`): acrescente a tabela em `SOURCE_TABLES`.
+
+```python
+SourceTable("tbsuppliers", (("code", "int"), ("name", "str"), ("email", "str"))),
+```
+
+Se uma tabela existente ganhou coluna, acrescente a coluna também (`("supplier", "int")` em
+`tbproducts`).
+
+**2. Bronze** (`sql/ddl/02_bronze.sql`): crie a tabela com os tipos da fonte, mais `_ingested_at` e
+`_batch_id`, e a view `V_TBSUPPLIERS_LATEST`, copiando a de `tbcategories`.
+
+**3. Watermark** (`sql/ddl/01_control.sql`): acrescente `('TBSUPPLIERS', NULL)` no `VALUES` do
+`MERGE`. O MERGE só insere o que falta, então é seguro rodar de novo.
+
+**4. Silver**
+- Em `sql/ddl/03_silver.sql`, declare a tabela.
+- Crie `sql/silver/02_tbsuppliers.sql`, copiando o script de categorias. Ele precisa rodar **antes**
+  de `tbproducts`, para a checagem de FK órfã enxergar os fornecedores. Os scripts rodam em ordem
+  alfabética, então renumere os seguintes com `git mv` (por exemplo,
+  `02_tbproducts.sql` → `03_tbproducts.sql`).
+- No script de produtos, acrescente a rejeição
+  `WHEN b.supplier IS NOT NULL AND s.code IS NULL THEN 'FK órfã: supplier=...'`, com um
+  `LEFT JOIN SILVER.TBSUPPLIERS s ON s.code = b.supplier`.
+
+**5. Gold**
+- Em `sql/ddl/04_gold.sql`, crie a sequence, a tabela `DIM_SUPPLIERS` e o membro `-1`.
+- Crie `sql/gold/NN_dim_suppliers.sql` copiando o MERGE de `01_dim_categories.sql`. Troque só as
+  colunas e a lista de atributos do hash.
+
+**6. Testes**: inclua a dimensão nova em:
+- `01_layer_counts.sql` (contagens entre camadas);
+- `03_scd2_single_current.sql` e `04_scd2_contiguous_ranges.sql` (SCD2);
+- `05_fact_orphan_keys.sql` e `06_fact_version_resolution.sql`, se ela entrar na fato.
+
+**7. README**: atualize as tabelas de regras por camada.
+
+### A.2 Decisão de modelagem: como a dimensão se liga à fato
+
+| Opção | Como fica | Quando usar |
+|---|---|---|
+| **A — pelo produto** (snowflake) | `DIM_PRODUCTS` ganha `supplier_code`, como já tem `category_code`. A fato não muda. | O fornecedor é sempre o mesmo para o produto. Mais simples. |
+| **B — direto na fato** (estrela) | A fato ganha `supplier_sk`, resolvido pela data do pedido como as outras chaves. No `04_fact_orders.sql` entra mais um `LEFT JOIN` com `COALESCE(..., -1)`. | O fornecedor depende do pedido. |
+
+### A.3 Cuidados com tabelas que já existem
+
+**1. `CREATE TABLE IF NOT EXISTS` não altera tabelas existentes.** Coluna nova em tabela que já
+existe precisa de um `ALTER` no DDL. Ele também pode rodar várias vezes:
+
+```sql
+ALTER TABLE BRONZE.TBPRODUCTS ADD COLUMN IF NOT EXISTS supplier NUMBER(10,0);
+ALTER TABLE SILVER.TBPRODUCTS ADD COLUMN IF NOT EXISTS supplier NUMBER(10,0);
+ALTER TABLE GOLD.FACT_ORDERS  ADD COLUMN IF NOT EXISTS supplier_sk NUMBER(38,0) DEFAULT -1;
+```
+
+**2. Atributo novo no hash gera uma versão nova de todos os registros.** Na opção A, ao acrescentar
+`supplier_code` ao hash de `DIM_PRODUCTS`, todos os produtos têm o hash alterado na execução
+seguinte e ganham uma versão nova, mesmo sem mudança real. Há duas saídas:
+- aceitar isso, já que o histórico continua consistente;
+- ou, antes do deploy, preencher a coluna nova nas versões vigentes e recalcular o `attr_hash`
+  delas com a fórmula nova. Assim só mudanças reais geram versão:
+
+```sql
+UPDATE GOLD.DIM_PRODUCTS d
+   SET supplier_code = s.supplier,
+       attr_hash = SHA2(CONCAT_WS('|',
+           COALESCE(s.description, '~'),
+           COALESCE(TO_VARCHAR(s.salevalue), '~'),
+           COALESCE(TO_VARCHAR(s.active), '~'),
+           COALESCE(TO_VARCHAR(s.category), '~'),
+           COALESCE(TO_VARCHAR(s.supplier), '~')), 256)   -- mesma fórmula do novo MERGE
+  FROM SILVER.TBPRODUCTS s
+ WHERE d.product_code = s.code
+   AND d.is_current;
+```
+
+Rode esse `UPDATE` depois de o Silver já ter a coluna nova e antes do primeiro Gold com o hash novo.
+
+### A.4 Checklist
+
+- [ ] `etl/extract.py` — tabela/coluna em `SOURCE_TABLES`
+- [ ] `sql/ddl/01_control.sql` — seed do watermark
+- [ ] `sql/ddl/02_bronze.sql` — tabela + view `_LATEST` (+ `ALTER` se for coluna nova)
+- [ ] `sql/ddl/03_silver.sql` + `sql/silver/NN_*.sql` — na ordem certa de dependência
+- [ ] `sql/ddl/04_gold.sql` + `sql/gold/NN_dim_*.sql` — sequence, tabela, membro `-1`, MERGE
+- [ ] `sql/gold/04_fact_orders.sql` — se a dimensão entrar na fato
+- [ ] `sql/tests/` — contagens, SCD2 e chaves órfãs
+- [ ] Hash: aceitar a nova versão em massa ou recalcular o `attr_hash` antes
+- [ ] Rodar localmente `python -m etl.main --step all` antes do push
