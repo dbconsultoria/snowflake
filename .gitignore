@@ -3,6 +3,12 @@
 .env.*
 !.env.example
 
+# Keys / certificates (Snowflake key pair, TLS)
+*.p8
+*.pub
+*.pem
+*.key
+
 # Virtual environments
 .venv/
 venv/

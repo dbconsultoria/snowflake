@@ -1,0 +1,6 @@
+snowflake-connector-python[pandas]>=3.12,<4
+pandas>=2.2,<3
+PyMySQL>=1.1,<2
+cryptography>=42
+certifi>=2024.2.2
+python-dotenv>=1.0,<2
